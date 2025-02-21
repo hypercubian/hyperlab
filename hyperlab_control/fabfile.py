@@ -1,7 +1,10 @@
 import getpass
+import json
 import logging
+import os
 import socket
 
+import paramiko
 from fabric import Connection, task
 
 # Logging Configuration
@@ -11,6 +14,10 @@ logging.basicConfig(
 )
 
 VM_HOSTS = ["atlas"]
+
+MAC_ADDRESSES = {
+    "atlas": "58:47:CA:75:EB:98"
+}
 
 
 def get_connection(host):
@@ -273,17 +280,6 @@ def save_vm(c, vm_name):
             logging.error(f"⚠️ Failed to save state of {vm_name} on {host}.")
 
 
-# Dictionary of hosts and their MAC addresses (Update this with real MACs)
-MAC_ADDRESSES = {
-    "atlas": "58:47:CA:75:EB:98"  # Replace with the actual MAC address
-}
-
-
-#
-#
-# @task
-
-
 @task
 def wake_on_lan(c, host):
     """Send a Wake-on-LAN magic packet."""
@@ -383,3 +379,263 @@ def restart_host(c):
             logging.info(f"✅ {host} is restarting.")
         else:
             logging.error(f"⚠️ Failed to restart {host}.")
+
+
+def get_ssh_key_path():
+    """Return the default SSH key path."""
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".ssh", "id_rsa")
+
+
+@task
+def setup_ssh(c):
+    """Sets up SSH key authentication for an Ubuntu server."""
+
+    # Prompt for the server IP
+    server_ip = input("Enter the Ubuntu server IP: ").strip()
+    username = getpass.getuser()  # Get the current Windows username
+    ssh_key_path = get_ssh_key_path()
+    pub_key_path = f"{ssh_key_path}.pub"
+
+    # Check if SSH key exists, generate if not
+    if not os.path.exists(ssh_key_path):
+        print("SSH key not found. Generating one now...")
+        os.system(f'ssh-keygen -t rsa -b 4096 -f "{ssh_key_path}" -N ""')
+    else:
+        print("SSH key already exists. Using existing key.")
+
+    # Ensure the public key exists
+    if not os.path.exists(pub_key_path):
+        print("Public key not found. Ensure ssh-keygen ran correctly.")
+        return
+
+    # Copy public key to the remote server using ssh-copy-id
+    print(f"Copying SSH public key to {server_ip}...")
+    os.system(f'ssh-copy-id -i "{pub_key_path}" {username}@{server_ip}')
+
+    # Secure SSH on the server
+    print("Configuring SSH settings on the server...")
+    os.system()
+
+    print("SSH key authentication setup complete!")
+    print(f"You can now SSH into the server using: ssh {username}@{server_ip}")
+
+
+@task
+def get_vm_macs(c):
+    """Retrieve VM names and their MAC addresses for all VM hosts."""
+    all_vms = []
+
+    for host in VM_HOSTS:
+        conn = get_connection(host)
+        if not conn:
+            continue
+
+        logging.info(f"🔍 Retrieving VM MAC addresses from {host}...")
+
+        # Force use of 64-bit PowerShell and load Hyper-V module
+        command = (
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-VM | Get-VMNetworkAdapter | Select-Object VMName,MacAddress | ConvertTo-Json -Depth 1'
+        )
+
+        result = execute_command(conn, command)
+
+        if result:
+            try:
+                vms = json.loads(result.strip())
+                if isinstance(vms, dict):  # Single VM case
+                    vms = [vms]
+
+                for vm in vms:
+                    vm["Host"] = host
+
+                all_vms.extend(vms)
+                logging.info(f"✅ Retrieved {len(vms)} VM MACs from {host}.")
+            except json.JSONDecodeError as e:
+                logging.error(f"⚠️ Failed to parse JSON from {host}: {e}\nRaw Output:\n{result}")
+        else:
+            logging.error(f"⚠️ No VM MAC addresses found on {host}.")
+
+    if all_vms:
+        print(json.dumps(all_vms, indent=4))
+    else:
+        logging.info("⚠️ No VM MAC addresses retrieved.")
+
+
+def retrieve_vm_macs_via_ssh(host):
+    """
+    Retrieve VM MAC addresses via direct SSH and return as a list of dictionaries.
+
+    Args:
+        host (str): The remote machine's hostname or IP.
+
+    Returns:
+        list[dict]: A list of VM MAC addresses with structure:
+        [
+            {"Host": "atlas", "VMName": "VM1", "MacAddress": "00:15:5D:23:4A:12"},
+            {"Host": "atlas", "VMName": "VM2", "MacAddress": "00:15:5D:67:89:AB"}
+        ]
+    """
+    username = getpass.getuser()
+    mac_list = []
+
+    try:
+        logging.info(f"🔍 Connecting via SSH to {host}...")
+
+        # Establish SSH connection
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=host, username=username)
+
+        logging.info(f"✅ SSH connection established with {host}")
+
+        # Run PowerShell command to retrieve VM MAC addresses
+        command = (
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+            '"Get-VM | Get-VMNetworkAdapter | Select-Object VMName,MacAddress | ConvertTo-Json -Depth 1"'
+        )
+        stdin, stdout, stderr = client.exec_command(command)
+
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+
+        client.close()
+
+        if error:
+            logging.error(f"⚠️ PowerShell Error from {host}:\n{error}")
+            return mac_list  # Return empty list if error occurs
+
+        if output:
+            try:
+                vms = json.loads(output)
+
+                if isinstance(vms, dict):  # Single VM case
+                    vms = [vms]
+
+                for vm in vms:
+                    vm["Host"] = host  # Attach host info
+
+                mac_list.extend(vms)
+                logging.info(f"✅ Retrieved {len(vms)} VM MACs from {host}.")
+            except json.JSONDecodeError as e:
+                logging.error(f"⚠️ Failed to parse JSON from {host}: {e}\nRaw Output:\n{output}")
+
+    except Exception as e:
+        logging.error(f"❌ SSH connection failed to {host}: {e}")
+
+    return mac_list  # Return list of VM MAC addresses
+
+
+@task
+def vm_macs(c):
+    """Fabric task to retrieve VM MAC addresses via direct SSH and display them."""
+    all_vm_macs = []
+
+    for host in VM_HOSTS:
+        vm_macs = retrieve_vm_macs_via_ssh(host)
+        all_vm_macs.extend(vm_macs)
+
+    # Print structured output
+    if all_vm_macs:
+        print(json.dumps(all_vm_macs, indent=4))
+    else:
+        logging.info("⚠️ No VM MAC addresses retrieved.")
+
+
+def retrieve_vm_network_info(host):
+    """
+    Retrieve VM names, MAC addresses, and IP addresses via SSH using PowerShell.
+
+    Args:
+        host (str): The remote machine's hostname or IP.
+
+    Returns:
+        list[dict]: A list of VM network information with structure:
+        [
+            {"Host": "atlas", "VMName": "VM1", "IP": "192.168.1.101", "MAC": "00:15:5D:23:4A:12"},
+            {"Host": "atlas", "VMName": "VM2", "IP": "192.168.1.102", "MAC": "00:15:5D:67:89:AB"}
+        ]
+    """
+    username = getpass.getuser()
+    vm_network_info = []
+
+    try:
+        logging.info(f"🔍 Connecting via SSH to {host}...")
+
+        # Establish SSH connection
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=host, username=username)
+
+        logging.info(f"✅ SSH connection established with {host}")
+
+        # PowerShell command to get VM Names, MAC addresses, and IP addresses
+        command = (
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+            '"Get-VM | Get-VMNetworkAdapter | Select-Object VMName, MacAddress, IPAddresses | '
+            'ConvertTo-Json -Depth 2"'
+        )
+
+        stdin, stdout, stderr = client.exec_command(command)
+
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+
+        client.close()
+
+        if error:
+            logging.error(f"⚠️ PowerShell Error from {host}:\n{error}")
+            return vm_network_info  # Return empty list if error occurs
+
+        if output:
+            try:
+                vms = json.loads(output)
+
+                if isinstance(vms, dict):  # Single VM case
+                    vms = [vms]
+
+                for vm in vms:
+                    ip_addresses = vm.get("IPAddresses", [])
+                    primary_ip = ip_addresses[0] if ip_addresses else "Unknown"
+
+                    vm_data = {
+                        "Host": host,
+                        "VMName": vm.get("VMName", "Unknown"),
+                        "MAC": vm.get("MacAddress", "Unknown"),
+                        "IP": primary_ip
+                    }
+
+                    vm_network_info.append(vm_data)
+
+                logging.info(f"✅ Retrieved {len(vm_network_info)} VM network entries from {host}.")
+
+            except json.JSONDecodeError as e:
+                logging.error(f"⚠️ Failed to parse JSON from {host}: {e}\nRaw Output:\n{output}")
+
+    except Exception as e:
+        logging.error(f"❌ SSH connection failed to {host}: {e}")
+
+    return vm_network_info  # Return list of VM network information
+
+
+@task
+def get_vm_net_info(c):
+    """Fabric task to retrieve VM names, MAC, and IP addresses via SSH."""
+    all_vm_network_data = []
+
+    for host in VM_HOSTS:
+        network_data = retrieve_vm_network_info(host)
+        all_vm_network_data.extend(network_data)
+
+    # Print structured output
+    if all_vm_network_data:
+        print(json.dumps(all_vm_network_data, indent=4))
+    else:
+        logging.info("⚠️ No VM network information retrieved.")
+
+
+
+@task
+def lst(c):
+    c.run("fab --list")
+
