@@ -634,6 +634,25 @@ def get_vm_net_info(c):
         logging.info("⚠️ No VM network information retrieved.")
 
 
+@task
+def enable_nested_virtualization(c, vm_name):
+    """Enable Nested Virtualization for a specific VM."""
+    for host in VM_HOSTS:
+        conn = get_connection(host)
+        if not conn:
+            continue
+
+        logging.info(f"🔧 Enabling Nested Virtualization for {vm_name} on {host}...")
+
+        # PowerShell command to enable Nested Virtualization
+        command = f'Set-VMProcessor -VMName "{vm_name}" -ExposeVirtualizationExtensions $true'
+
+        result = execute_command(conn, command)
+        if result is not None:
+            logging.info(f"✅ Nested Virtualization enabled for {vm_name} on {host}.")
+        else:
+            logging.error(f"⚠️ Failed to enable Nested Virtualization for {vm_name} on {host}.")
+
 
 @task
 def lst(c):
